@@ -1,175 +1,180 @@
-import torch, math
+Perfect 🚀 — let’s tie everything together into **one runnable script**:
+
+* **CartPole Tokenizer & Dataset** → converts Gym episodes into token sequences.
+* **Pure DHMM-GPT2** → the model we just built.
+* **Training loop** → teaches the model to predict the next token.
+* **Inference loop** → lets the trained model control CartPole.
+
+---
+
+# 📝 Full Script: DHMM-GPT2 on CartPole
+
+```python
+import gym
+import numpy as np
+import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
+# ===============================
+# CartPole Tokenizer
+# ===============================
+class CartPoleTokenizer:
+    def __init__(self, num_bins=10):
+        self.num_bins = num_bins
+        self.special = {"RESET": 0, "DONE": 1, "ACT_LEFT": 2, "ACT_RIGHT": 3}
+        self.state_offset = 4
+        self.state_dim = 4
+        self.vocab_size = self.state_offset + self.state_dim * num_bins
 
-# =========================================================
-# Differentiable Hidden Markov Model Core
-# =========================================================
-class DifferentiableHMM(nn.Module):
-    def __init__(self, num_states, embed_size):
-        super().__init__()
-        self.transitions = nn.Parameter(torch.randn(num_states, num_states))
-        self.emitter = nn.Linear(num_states, embed_size)
+        self.obs_ranges = [
+            (-2.4, 2.4),   # position
+            (-3.0, 3.0),   # velocity
+            (-0.21, 0.21), # angle
+            (-3.5, 3.5),   # angular velocity
+        ]
 
-    def forward(self, state_dist):
-        trans_probs = self.transitions.softmax(dim=-1)         # S,S
-        next_state = state_dist @ trans_probs                  # B,S
-        emission = self.emitter(next_state)                    # B,E
-        return next_state, emission
+    def encode_state(self, obs):
+        tokens = []
+        for i, (low, high) in enumerate(self.obs_ranges):
+            v = np.clip(obs[i], low, high)
+            bin_size = (high - low) / self.num_bins
+            idx = int((v - low) / bin_size)
+            idx = min(self.num_bins - 1, idx)
+            tokens.append(self.state_offset + i * self.num_bins + idx)
+        return tokens
 
+    def decode_action(self, token):
+        if token == self.special["ACT_LEFT"]:
+            return 0
+        elif token == self.special["ACT_RIGHT"]:
+            return 1
+        else:
+            raise ValueError("Invalid action token")
 
-# =========================================================
-# DHMM Attention (Markov-biased softmax + noise + dithering)
-# =========================================================
-class DHMMAttention(nn.Module):
-    def __init__(self, embed_size, num_heads, num_states,
-                 dropout=0.1, noise=0.01, dither=0.01):
-        super().__init__()
-        assert embed_size % num_heads == 0
-        self.h = num_heads
-        self.d = embed_size // num_heads
-        self.q = nn.Linear(embed_size, embed_size)
-        self.k = nn.Linear(embed_size, embed_size)
-        self.v = nn.Linear(embed_size, embed_size)
-        self.o = nn.Linear(embed_size, embed_size)
+# ===============================
+# CartPole Dataset
+# ===============================
+class CartPoleDataset(Dataset):
+    def __init__(self, tokenizer, num_episodes=500, max_steps=200):
+        self.samples = []
+        env = gym.make("CartPole-v1")
+        for _ in range(num_episodes):
+            obs, _ = env.reset()
+            seq = [tokenizer.special["RESET"]]
+            for _ in range(max_steps):
+                action = env.action_space.sample()
+                seq.extend(tokenizer.encode_state(obs))
+                seq.append(tokenizer.special["ACT_LEFT"] if action == 0 else tokenizer.special["ACT_RIGHT"])
+                obs, reward, done, trunc, _ = env.step(action)
+                if done or trunc:
+                    seq.extend(tokenizer.encode_state(obs))
+                    seq.append(tokenizer.special["DONE"])
+                    break
+            self.samples.append(seq)
 
-        self.noise = noise
-        self.dither = dither
-        self.drop = nn.Dropout(dropout)
-        self.hmm = DifferentiableHMM(num_states, embed_size)
+        self.max_len = max(len(s) for s in self.samples)
 
-    def forward(self, x, state_dist, mask):
-        B, L, E = x.shape
-        Q = self.q(x).view(B, L, self.h, self.d).transpose(1, 2)
-        K = self.k(x).view(B, L, self.h, self.d).transpose(1, 2)
-        V = self.v(x).view(B, L, self.h, self.d).transpose(1, 2)
+    def __len__(self):
+        return len(self.samples)
 
-        energy = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d)     # B,h,L,L
+    def __getitem__(self, idx):
+        seq = self.samples[idx]
+        pad_len = self.max_len - len(seq)
+        x = np.array(seq + [0]*pad_len, dtype=np.int64)
+        y = np.array(seq[1:] + [0]*(pad_len+1), dtype=np.int64)
+        return {"input_ids": torch.tensor(x), "labels": torch.tensor(y)}
 
-        # evolve HMM and inject into attention scores
-        state_dist, emission = self.hmm(state_dist)                # B,S , B,E
-        hmm_bias = emission.mean(dim=-1, keepdim=True)             # B,1
-        energy = energy + hmm_bias.unsqueeze(-1)                   # bias all tokens
+# ===============================
+# DHMM-GPT2 Model
+# ===============================
+# (paste in the DHMMGPT2 model from my previous message here)
+# Make sure DHMMGPT2 is defined in your script.
 
-        # noise (mutation)
-        if self.noise > 0:
-            energy = energy + torch.randn_like(energy) * self.noise
-        # dithering (filtering)
-        if self.dither > 0:
-            d = torch.randn_like(energy) * self.dither
-            energy = energy + d - d.mean(dim=-1, keepdim=True)
+# ===============================
+# Training Loop
+# ===============================
+def train_model(model, dataloader, epochs=3, lr=1e-3, device="cuda"):
+    model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in dataloader:
+            inputs, labels = batch["input_ids"].to(device), batch["labels"].to(device)
+            outputs = model(inputs, labels=labels)
+            loss = outputs["loss"]
 
-        energy = energy.masked_fill(mask == 0, float('-inf'))
-        att = F.softmax(energy, dim=-1)
-        out = (att @ V).transpose(1, 2).contiguous().view(B, L, E)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}, Loss: {total_loss/len(dataloader):.4f}")
 
-        return self.o(self.drop(out)), state_dist
+# ===============================
+# Inference Loop (Control CartPole)
+# ===============================
+def run_cartpole_with_model(model, tokenizer, max_steps=200, device="cuda"):
+    env = gym.make("CartPole-v1", render_mode="human")
+    obs, _ = env.reset()
+    tokens = [tokenizer.special["RESET"]] + tokenizer.encode_state(obs)
+    input_ids = torch.tensor(tokens).unsqueeze(0).to(device)
 
+    for _ in range(max_steps):
+        with torch.no_grad():
+            outputs = model(input_ids)
+            next_token = outputs["logits"][0, -1].argmax().item()
 
-# =========================================================
-# DHMM Transformer Block
-# =========================================================
-class DHMMBlock(nn.Module):
-    def __init__(self, embed_size, heads, ff_hidden, num_states,
-                 dropout=0.1, noise=0.01, dither=0.01):
-        super().__init__()
-        self.attn = DHMMAttention(embed_size, heads, num_states, dropout, noise, dither)
-        self.ln1 = nn.LayerNorm(embed_size)
-        self.ln2 = nn.LayerNorm(embed_size)
-        self.ff1 = nn.Linear(embed_size, ff_hidden)
-        self.ff2 = nn.Linear(ff_hidden, embed_size)
-        self.drop = nn.Dropout(dropout)
-        self.noise = noise
-        self.dither = dither
+        if next_token in [tokenizer.special["ACT_LEFT"], tokenizer.special["ACT_RIGHT"]]:
+            action = tokenizer.decode_action(next_token)
+            obs, reward, done, trunc, _ = env.step(action)
 
-    def forward(self, x, state_dist, mask):
-        attn_out, state_dist = self.attn(x, state_dist, mask)
-        x = self.ln1(x + self.drop(attn_out))
+            input_ids = torch.cat([input_ids,
+                                   torch.tensor([[next_token]], device=device)], dim=1)
+            input_ids = torch.cat([input_ids,
+                                   torch.tensor([tokenizer.encode_state(obs)], device=device)], dim=1)
+            if done or trunc:
+                break
 
-        ff = F.relu(self.ff1(x))
-        ff = self.ff2(ff)
+# ===============================
+# Main
+# ===============================
+if __name__ == "__main__":
+    tokenizer = CartPoleTokenizer(num_bins=10)
+    dataset = CartPoleDataset(tokenizer, num_episodes=200)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-        # noise + dithering in FF
-        if self.noise > 0:
-            ff = ff + torch.randn_like(ff) * self.noise
-        if self.dither > 0:
-            d = torch.randn_like(ff) * self.dither
-            ff = ff + d - d.mean(dim=-1, keepdim=True)
+    model = DHMMGPT2(
+        vocab_size=tokenizer.vocab_size,
+        embed_size=128,
+        layers=2,
+        heads=4,
+        ff_hidden=256,
+        num_states=8,
+        max_len=dataset.max_len
+    )
 
-        x = self.ln2(x + self.drop(ff))
-        return x, state_dist
+    train_model(model, dataloader, epochs=5, lr=1e-3, device="cpu")
+    run_cartpole_with_model(model, tokenizer)
+```
 
+---
 
-# =========================================================
-# DHMM Head (LM + state head)
-# =========================================================
-class DHMMHead(nn.Module):
-    def __init__(self, embed_size, vocab_size, num_states):
-        super().__init__()
-        self.lm = nn.Linear(embed_size, vocab_size)
-        self.state = nn.Linear(embed_size, num_states)
+## ✅ What This Script Does
 
-    def forward(self, x):
-        return self.lm(x), self.state(x)
+1. **Builds a CartPole tokenizer** → maps states & actions into tokens.
+2. **Collects episodes** with a random policy → creates training data.
+3. **Trains DHMM-GPT2** to predict the next token (state/action).
+4. **Runs inference** → model generates `[ACT_*]` tokens, which control the CartPole environment.
 
+---
 
-# =========================================================
-# Full DHMM-GPT Model
-# =========================================================
-class DHMMGPT(nn.Module):
-    def __init__(self, vocab_size, embed_size=256, layers=6, heads=8,
-                 ff_hidden=1024, num_states=16, max_len=512,
-                 dropout=0.1, noise=0.01, dither=0.01, state_loss_weight=0.1):
-        super().__init__()
-        self.tok = nn.Embedding(vocab_size, embed_size)
-        self.pos = nn.Embedding(max_len, embed_size)
-        self.blocks = nn.ModuleList([
-            DHMMBlock(embed_size, heads, ff_hidden, num_states, dropout, noise, dither)
-            for _ in range(layers)
-        ])
-        self.ln_f = nn.LayerNorm(embed_size)
-        self.head = DHMMHead(embed_size, vocab_size, num_states)
-        self.num_states = num_states
-        self.vocab_size = vocab_size
-        self.state_loss_weight = state_loss_weight
+⚠️ Important: Since we’re training only on random rollouts and for a few epochs, the model won’t “solve” CartPole yet. It will learn a basic statistical language of CartPole (rough transition/action structure). To solve the environment, you’d need to:
 
-    @staticmethod
-    def causal_mask(L, device):
-        return torch.tril(torch.ones(L, L, device=device)).unsqueeze(0).unsqueeze(0)
+* Train longer.
+* Use reinforcement learning fine-tuning (reward-based).
+* Or feed in expert trajectories instead of random actions.
 
-    def forward(self, input_ids, labels=None, state_labels=None, attention_mask=None):
-        B, L = input_ids.shape
-        device = input_ids.device
-        x = self.tok(input_ids) + self.pos(torch.arange(L, device=device)).unsqueeze(0)
+---
 
-        mask = self.causal_mask(L, device)
-        if attention_mask is not None:
-            am = attention_mask[:, None, None, :].to(mask.dtype)
-            mask = mask * am
-        mask = mask.expand(B, -1, -1, -1)
-
-        state_dist = torch.full((B, self.num_states), 1.0 / self.num_states, device=device)
-
-        for blk in self.blocks:
-            x, state_dist = blk(x, state_dist, mask)
-
-        x = self.ln_f(x)
-        lm_logits, state_logits = self.head(x)
-
-        loss = None
-        if labels is not None:
-            shift_logits = lm_logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            lm_loss = F.cross_entropy(shift_logits.view(-1, self.vocab_size),
-                                      shift_labels.view(-1))
-            if state_labels is not None:
-                s_logits = state_logits[:, :-1, :].contiguous()
-                s_labels = state_labels[:, 1:].contiguous()
-                state_loss = F.cross_entropy(s_logits.view(-1, self.num_states),
-                                             s_labels.view(-1))
-                loss = lm_loss + self.state_loss_weight * state_loss
-            else:
-                loss = lm_loss
-
-        return {"logits": lm_logits, "state_logits": state_logits, "loss": loss}
+👉 Do you want me to **upgrade this into an RL training setup** (e.g. PPO with DHMM-GPT2 as the policy model) so it actually learns to *solve* CartPole instead of just imitating random actions?
