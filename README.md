@@ -278,3 +278,173 @@ Once trained, you can:
 ---
 
 👉 To make this concrete, do you want me to **build a small demo where DHMM-GPT2 learns addition or sorting** as a token language, so you can see it mastering a simple algorithm before scaling to Gym?
+
+Perfect ✅ — let’s build a **toy demo where DHMM-GPT2 learns an algorithm**. We’ll start with **addition** since it’s simple, fully symbolic, and lets us test the “algorithm as a language” idea before scaling up.
+
+---
+
+# 🧩 Step 1: Define the Token Language for Addition
+
+We define tokens for:
+
+* **Digits 0–9** → tokens `0–9`
+* **Operators**: `+`, `=`, → tokens `10`, `11`
+* **Outputs** (digits again, but we reuse the same 0–9 tokens)
+
+So the vocabulary size = 12 tokens.
+
+---
+
+# 🧩 Step 2: Generate Training Data
+
+We generate synthetic sequences like:
+
+```
+[2, "+", 3, "="] → [5]
+[7, "+", 8, "="] → [1, 5]
+```
+
+(where `[1, 5]` means the model predicts the digits of `15`).
+
+---
+
+# 🧩 Step 3: Train DHMM-GPT2
+
+* Input: `[7, "+", 8, "="]`
+* Target: `[1, 5]`
+* Objective: cross-entropy loss on next-token prediction.
+
+---
+
+# 🧩 Step 4: Inference
+
+* Give the model `[9, "+", 6, "="]`
+* It should output `[1, 5]`.
+
+---
+
+# 📝 Full Demo Code
+
+```python
+import random
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# -----------------------
+# Tokenizer for Addition
+# -----------------------
+class AdditionTokenizer:
+    def __init__(self):
+        self.digits = {str(i): i for i in range(10)}  # 0–9
+        self.ops = {"+": 10, "=": 11}
+        self.inv_vocab = {v: k for k, v in {**self.digits, **self.ops}.items()}
+        self.vocab_size = 12
+
+    def encode(self, expr, result):
+        return [self.digits[c] if c.isdigit() else self.ops[c] for c in expr] + \
+               [self.digits[c] for c in result]
+
+    def decode(self, tokens):
+        return "".join(self.inv_vocab[t] for t in tokens if t in self.inv_vocab)
+
+# -----------------------
+# Dataset
+# -----------------------
+class AdditionDataset(Dataset):
+    def __init__(self, tokenizer, num_samples=10000, max_num=20):
+        self.samples = []
+        for _ in range(num_samples):
+            a, b = random.randint(0, max_num), random.randint(0, max_num)
+            expr = list(str(a)) + ["+"] + list(str(b)) + ["="]
+            result = list(str(a+b))
+            tokens = tokenizer.encode(expr, result)
+            self.samples.append(tokens)
+        self.max_len = max(len(s) for s in self.samples)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        seq = self.samples[idx]
+        pad_len = self.max_len - len(seq)
+        x = torch.tensor(seq[:-1] + [0]*pad_len, dtype=torch.long)
+        y = torch.tensor(seq[1:] + [0]*pad_len, dtype=torch.long)
+        return {"input_ids": x, "labels": y}
+
+# -----------------------
+# Train Demo
+# -----------------------
+def train_addition(model, dataloader, epochs=5, lr=1e-3, device="cpu"):
+    model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    for ep in range(epochs):
+        total_loss = 0
+        for batch in dataloader:
+            x, y = batch["input_ids"].to(device), batch["labels"].to(device)
+            out = model(x, labels=y)
+            loss = out["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {ep+1}, Loss: {total_loss/len(dataloader):.4f}")
+
+# -----------------------
+# Inference
+# -----------------------
+def generate_addition(model, tokenizer, prompt, max_new_tokens=5, device="cpu"):
+    model.eval()
+    tokens = [tokenizer.digits[c] if c.isdigit() else tokenizer.ops[c] for c in prompt]
+    input_ids = torch.tensor(tokens).unsqueeze(0).to(device)
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            out = model(input_ids)
+            next_token = out["logits"][0, -1].argmax().item()
+            input_ids = torch.cat([input_ids, torch.tensor([[next_token]], device=device)], dim=1)
+    return tokenizer.decode(input_ids[0].tolist())
+
+# -----------------------
+# Run Everything
+# -----------------------
+if __name__ == "__main__":
+    tokenizer = AdditionTokenizer()
+    dataset = AdditionDataset(tokenizer, num_samples=5000, max_num=20)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # Use the DHMMGPT2 model we defined earlier
+    model = DHMMGPT2(
+        vocab_size=tokenizer.vocab_size,
+        embed_size=128,
+        layers=2,
+        heads=4,
+        ff_hidden=256,
+        num_states=8,
+        max_len=dataset.max_len
+    )
+
+    train_addition(model, dataloader, epochs=10, device="cpu")
+
+    # Test inference
+    print(generate_addition(model, tokenizer, "7+8="))
+    print(generate_addition(model, tokenizer, "9+6="))
+```
+
+---
+
+## ✅ What This Does
+
+1. Generates **synthetic addition problems** as token sequences.
+2. Trains **DHMM-GPT2** to autoregressively predict results.
+3. At inference, you can feed prompts like `"9+6="` and see if it outputs `"15"`.
+
+---
+
+⚠️ Notes:
+
+* This is **toy-level training**; you’ll need more epochs / a bigger model for perfect generalization.
+* But it demonstrates the principle: **define the tokens = define the algorithmic language** → GPT-2 (with DHMM) learns the algorithm.
+
+---
+
+👉 Do you want me to next **extend this to sorting** (so DHMM-GPT2 learns the *language of sorting steps*, not just arithmetic)?
