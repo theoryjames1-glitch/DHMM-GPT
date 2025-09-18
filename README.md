@@ -89,6 +89,143 @@
 
 ---
 
+# DHMM-GPT: Formal Spec (control-style)
+
+## 1) Sequences, tokens, embeddings
+
+* Tokens: $x_{1:T}$, vocab size $V$.
+* Embeddings: $e_t = E\,x_t + P_t \in \mathbb{R}^d$ with token matrix $E\in\mathbb{R}^{d\times V}$ and positional $P_t$.
+
+## 2) Latent Markov state (differentiable)
+
+* State simplex: $s_t \in \Delta^{N}$ (row vector), $\sum_i s_{t,i}=1,\; s_{t,i}\ge 0$.
+* Transition logits: $\Theta\in\mathbb{R}^{N\times N}$, transition matrix $A=\operatorname{softmax}_{\text{row}}(\Theta)$.
+* **Evolution (with input & noise/dither):**
+
+$$
+\tilde{s}_{t+1} = s_t A + B u_t + \varepsilon_t - \underbrace{\frac{1}{N}\mathbf{1}\mathbf{1}^\top \varepsilon_t}_{\text{dither centering}}
+,\quad
+s_{t+1}=\operatorname{softmax}(\tilde{s}_{t+1})
+$$
+
+where $u_t$ is an optional control/input (e.g., summary of $e_t$), $B\in\mathbb{R}^{N\times d_u}$, $\varepsilon_t\sim\mathcal{N}(0,\sigma^2 I)$ (mutation noise), and the mean-removal term implements dithering.
+
+* **Emission (state → feature):**
+
+$$
+z_t = W_s\, s_t \in \mathbb{R}^d,\quad W_s\in\mathbb{R}^{d\times N}
+$$
+
+## 3) DHMM-attention (per layer $\ell$, per head $h$)
+
+Given hidden $h^{(\ell-1)}\in\mathbb{R}^{T\times d}$:
+
+$$
+Q = h^{(\ell-1)} W_Q,\quad K = h^{(\ell-1)} W_K,\quad V = h^{(\ell-1)} W_V
+$$
+
+Split into $H$ heads of dim $d_h=d/H$. Scaled scores:
+
+$$
+S = \frac{QK^\top}{\sqrt{d_h}} \;+\; \underbrace{(1\!\!1^\top)\,b_t}_{\text{state bias}} \;+\; \eta - \operatorname{mean}_{\text{last}}(\eta)
+$$
+
+* **State bias:** $b_t = \alpha\, \bar{z}_t$, where $\bar{z}_t = \frac{1}{d}\mathbf{1}^\top z_t$ (scalar) or a learned projection of $z_t$ broadcast to keys; $\alpha$ is a learnable scale.
+* **Noise+dither on scores:** $\eta\sim\mathcal{N}(0,\tau^2)$ and mean-centering across last dim implements dithering.
+* Causal/attention mask $M\in\{0,-\infty\}^{T\times T}$ (and padding mask) added to $S$.
+
+$$
+A = \operatorname{softmax}(S+M),\quad
+H = A V,\quad
+\text{MHA}(h)=\bigoplus_{h=1}^{H} H_h\, W_O
+$$
+
+## 4) Feed-forward with noise+dither
+
+$$
+\tilde{h} = h + \operatorname{Dropout}(\text{MHA}(h)),\quad
+\hat{h} = \operatorname{LN}(\tilde{h})
+$$
+
+$$
+u = \phi(\hat{h} W_1 + b_1) W_2 + b_2,\quad
+u \leftarrow u + \xi - \operatorname{mean}_{\text{last}}(\xi),\;\; \xi\sim\mathcal{N}(0,\rho^2)
+$$
+
+$$
+h^{(\ell)} = \operatorname{LN}(\hat{h} + \operatorname{Dropout}(u))
+$$
+
+## 5) Layer coupling with DHMM
+
+At each layer/time:
+
+1. update $s_t\to s_{t+1}$ via §2 using an input summary $u_t=g(h_t^{(\ell-1)})$ (e.g., pooled hidden or token-local projection),
+2. compute $z_t=W_s s_t$,
+3. inject $z_t$ as bias in attention (§3) and optionally add $z_t$ to residual stream: $h^{(\ell)}\leftarrow h^{(\ell)}+ \beta z_t$.
+
+## 6) Decoder (GPT-style) / Encoder–Decoder
+
+* **Decoder-only (GPT):** causal mask; steps (2–5) applied per layer/time.
+* **Encoder–Decoder:** encoder uses bidirectional mask; decoder uses causal self-attn plus cross-attn where cross-scores also receive DHMM state bias (use same $s_t$ or a decoder-specific $s^{(dec)}_t$; encoder can maintain $s^{(enc)}_t$).
+
+## 7) Output heads
+
+* **LM head:** $ \ell_t = h_t W_{\text{lm}} + b_{\text{lm}} \in \mathbb{R}^{V}$.
+* **State head (optional):** $ r_t = h_t W_{\text{state}} + b_{\text{state}} \in \mathbb{R}^{N}$ (predict latent mode labels if available).
+
+## 8) Objectives
+
+* **Causal LM loss:**
+
+$$
+\mathcal{L}_{\text{LM}} = \frac{1}{T-1}\sum_{t=1}^{T-1} \operatorname{CE}\big(\operatorname{softmax}(\ell_t),\, x_{t+1}\big)
+$$
+
+* **State supervision (optional):**
+
+$$
+\mathcal{L}_{\text{state}} = \frac{1}{T}\sum_{t=1}^{T} \operatorname{CE}\big(\operatorname{softmax}(r_t),\, \hat{s}_t\big)
+$$
+
+* **Regularizers (stability/entropy):**
+
+$$
+\mathcal{R}_{\text{trans}} = -\lambda_H \sum_{i} H(A_{i,:}),\quad
+\mathcal{R}_{\text{smooth}} = \lambda_S \sum_{t}\|s_{t+1}-s_t\|_2^2
+$$
+
+Total:
+
+$$
+\mathcal{L} = \mathcal{L}_{\text{LM}} + \lambda_{\text{state}}\mathcal{L}_{\text{state}} + \mathcal{R}_{\text{trans}} + \mathcal{R}_{\text{smooth}}
+$$
+
+## 9) Control-style interpretation
+
+* **State**: $s_t$ (belief over modes).
+* **Dynamics**: $s_{t+1}=s_tA + Bu_t + \text{noise} \Rightarrow$ adaptive, learnable controller.
+* **Output/measurement**: $z_t=W_s s_t$ (influences attention and residual pathway).
+* **Feedback**: gradients from $\mathcal{L}$ update $A, W_s,$ and Transformer weights; noise ($\varepsilon_t,\eta,\xi$) = exploration; dithering = mean-removal filters to prevent drift.
+
+## 10) Inference / generation
+
+* **Autoregressive:** given $x_{\le t}$, iterate:
+
+  1. compute $h_t$ with DHMM-biased attention,
+  2. update $s_t\to s_{t+1}$,
+  3. sample $x_{t+1}\sim \operatorname{softmax}(\ell_t/T)$ with top-k/top-p if desired.
+* **Seq2seq:** run encoder on source to get $\{h^{enc}, s^{enc}\}$; decoder generates with cross-attn plus its own $s^{dec}$.
+
+## 11) Implementation knobs
+
+* Noise scales: $\sigma$ (state evolution), $\tau$ (attention scores), $\rho$ (FFN).
+* Dither = subtract per-row/last-dim mean of the injected noise.
+* Bias injection choices: scalar $b_t$, token-wise vector, or head-wise projection of $z_t$.
+* Input coupling $u_t=g(h_t)$: e.g., $g(h_t)=\text{LN}(h_t)W_u$ or pooled $\frac{1}{T}\sum_j h_j W_u$.
+
+That’s the “DHMM-GPT” theory in compact equations: a Transformer whose attention and residual dynamics are *closed-loop controlled* by a differentiable HMM with explicit stochastic exploration (noise) and stabilization (dithering).
+
 # 🚀 Why This Matters
 
 * In plain GPT, hidden state = opaque vector in self-attention.
