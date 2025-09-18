@@ -1,9 +1,103 @@
-Perfect 🚀 — let’s tie everything together into **one runnable script**:
+# 🎛 DHMM as a Control System
 
-* **CartPole Tokenizer & Dataset** → converts Gym episodes into token sequences.
-* **Pure DHMM-GPT2** → the model we just built.
-* **Training loop** → teaches the model to predict the next token.
-* **Inference loop** → lets the trained model control CartPole.
+## 1. **System States**
+
+* **Latent State Vector** $s_t \in \Delta^N$
+
+  * A probability distribution over $N$ hidden modes (like in a Markov chain).
+  * Instead of a single discrete state, we maintain a *soft belief state* over all possible states.
+* Think of it like a **state estimator** in control theory (similar to a Kalman filter’s belief over positions/velocities).
+
+---
+
+## 2. **System Dynamics**
+
+* Transition dynamics are defined by a parameter matrix $A \in \mathbb{R}^{N \times N}$.
+* Evolution equation:
+
+  $$
+  s_{t+1} = s_t A
+  $$
+* With softmax normalization on $A$, transitions are stochastic but differentiable.
+* This is the **state evolution law**, analogous to $x_{t+1} = Ax_t$ in linear control.
+
+---
+
+## 3. **Emissions**
+
+* Each hidden state generates an **observation embedding**:
+
+  $$
+  y_t = f(s_t) = W s_t
+  $$
+* This is the **measurement equation** in control form.
+* In Transformers, the emission embedding biases **attention scores** and **token prediction**.
+
+---
+
+## 4. **Noise + Dithering**
+
+* **Noise**:
+
+  * Additive exploration term to transitions:
+
+    $$
+    s_{t+1} = s_t A + \epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, \sigma^2)
+    $$
+  * Encourages exploration of alternate trajectories (like stochastic control or RL exploration noise).
+* **Dithering**:
+
+  * A filtering mechanism to smooth instability:
+
+    $$
+    \tilde{s}_{t+1} = s_{t+1} - \frac{1}{N} \mathbf{1}^\top s_{t+1}
+    $$
+  * Removes bias/drift, enforces balance across states.
+  * Analogous to **dither control** in signal processing.
+
+---
+
+## 5. **Control Input**
+
+* In standard control, we have inputs $u_t$.
+* In DHMM, inputs come from **tokens, observations, or external conditions**.
+* These modulate transitions:
+
+  $$
+  s_{t+1} = s_t A + B u_t
+  $$
+
+  where $u_t$ could be the current token embedding or environment observation.
+
+---
+
+## 6. **Feedback**
+
+* The prediction error (token mismatch, reward loss) acts as a **feedback signal**.
+* During training: gradient descent updates transition matrix $A$ and emission weights $W$.
+* Analogous to **adaptive control**, where parameters evolve to minimize tracking error.
+
+---
+
+## 7. **Closed-Loop View**
+
+* **Plant**: DHMM latent dynamics.
+* **Observer**: Transformer attention (integrates emissions + context).
+* **Controller**: Noise + dithering regulate exploration/exploitation.
+* **Cost Function**: Cross-entropy or RL reward objective.
+* This makes DHMM a **closed-loop control system with learned dynamics and outputs**.
+
+---
+
+# 🚀 Why This Matters
+
+* In plain GPT, hidden state = opaque vector in self-attention.
+* In DHMM-GPT, hidden state = explicit **probabilistic automaton**, giving:
+
+  * **Interpretability**: latent modes correspond to algorithmic phases.
+  * **Robustness**: dithering prevents collapse into trivial modes.
+  * **Exploration**: noise enables diverse policy learning.
+  * **Adaptability**: transitions evolve like adaptive control gains.
 
 ---
 
