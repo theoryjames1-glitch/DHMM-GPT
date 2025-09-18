@@ -1,174 +1,175 @@
-# 📝 Full DHMM-GPT Implementation
-
-```python
-import torch
+import torch, math
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 # =========================================================
-# Differentiable Hidden Markov Module
+# Differentiable Hidden Markov Model Core
 # =========================================================
 class DifferentiableHMM(nn.Module):
     def __init__(self, num_states, embed_size):
         super().__init__()
-        self.num_states = num_states
-        self.embed_size = embed_size
-
         self.transitions = nn.Parameter(torch.randn(num_states, num_states))
         self.emitter = nn.Linear(num_states, embed_size)
 
     def forward(self, state_dist):
-        # transition
-        trans_probs = torch.softmax(self.transitions, dim=-1)
-        next_state_dist = torch.matmul(state_dist, trans_probs)
-        # emission
-        emission = self.emitter(next_state_dist)
-        return next_state_dist, emission
+        trans_probs = self.transitions.softmax(dim=-1)         # S,S
+        next_state = state_dist @ trans_probs                  # B,S
+        emission = self.emitter(next_state)                    # B,E
+        return next_state, emission
 
 
 # =========================================================
-# Multi-Head Self Attention
+# DHMM Attention (Markov-biased softmax + noise + dithering)
 # =========================================================
-class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_size, num_heads, dropout=0.1):
+class DHMMAttention(nn.Module):
+    def __init__(self, embed_size, num_heads, num_states,
+                 dropout=0.1, noise=0.01, dither=0.01):
         super().__init__()
         assert embed_size % num_heads == 0
-        self.embed_size = embed_size
-        self.num_heads = num_heads
-        self.head_dim = embed_size // num_heads
+        self.h = num_heads
+        self.d = embed_size // num_heads
+        self.q = nn.Linear(embed_size, embed_size)
+        self.k = nn.Linear(embed_size, embed_size)
+        self.v = nn.Linear(embed_size, embed_size)
+        self.o = nn.Linear(embed_size, embed_size)
 
-        self.q_proj = nn.Linear(embed_size, embed_size)
-        self.k_proj = nn.Linear(embed_size, embed_size)
-        self.v_proj = nn.Linear(embed_size, embed_size)
-        self.fc_out = nn.Linear(embed_size, embed_size)
+        self.noise = noise
+        self.dither = dither
+        self.drop = nn.Dropout(dropout)
+        self.hmm = DifferentiableHMM(num_states, embed_size)
 
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None):
+    def forward(self, x, state_dist, mask):
         B, L, E = x.shape
+        Q = self.q(x).view(B, L, self.h, self.d).transpose(1, 2)
+        K = self.k(x).view(B, L, self.h, self.d).transpose(1, 2)
+        V = self.v(x).view(B, L, self.h, self.d).transpose(1, 2)
 
-        Q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        energy = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d)     # B,h,L,L
 
-        # scaled dot product
-        energy = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # evolve HMM and inject into attention scores
+        state_dist, emission = self.hmm(state_dist)                # B,S , B,E
+        hmm_bias = emission.mean(dim=-1, keepdim=True)             # B,1
+        energy = energy + hmm_bias.unsqueeze(-1)                   # bias all tokens
 
-        if mask is not None:
-            energy = energy.masked_fill(mask == 0, float("-inf"))
+        # noise (mutation)
+        if self.noise > 0:
+            energy = energy + torch.randn_like(energy) * self.noise
+        # dithering (filtering)
+        if self.dither > 0:
+            d = torch.randn_like(energy) * self.dither
+            energy = energy + d - d.mean(dim=-1, keepdim=True)
 
-        attention = torch.softmax(energy, dim=-1)
-        out = torch.matmul(attention, V).transpose(1, 2).contiguous().view(B, L, E)
+        energy = energy.masked_fill(mask == 0, float('-inf'))
+        att = F.softmax(energy, dim=-1)
+        out = (att @ V).transpose(1, 2).contiguous().view(B, L, E)
 
-        return self.fc_out(out)
+        return self.o(self.drop(out)), state_dist
 
 
 # =========================================================
-# Transformer Block with HMM
+# DHMM Transformer Block
 # =========================================================
 class DHMMBlock(nn.Module):
-    def __init__(self, embed_size, num_heads, ff_hidden, num_states, dropout=0.1):
+    def __init__(self, embed_size, heads, ff_hidden, num_states,
+                 dropout=0.1, noise=0.01, dither=0.01):
         super().__init__()
-        self.attn = MultiHeadAttention(embed_size, num_heads, dropout)
-        self.norm1 = nn.LayerNorm(embed_size)
-        self.norm2 = nn.LayerNorm(embed_size)
+        self.attn = DHMMAttention(embed_size, heads, num_states, dropout, noise, dither)
+        self.ln1 = nn.LayerNorm(embed_size)
+        self.ln2 = nn.LayerNorm(embed_size)
+        self.ff1 = nn.Linear(embed_size, ff_hidden)
+        self.ff2 = nn.Linear(ff_hidden, embed_size)
+        self.drop = nn.Dropout(dropout)
+        self.noise = noise
+        self.dither = dither
 
-        self.ff = nn.Sequential(
-            nn.Linear(embed_size, ff_hidden),
-            nn.ReLU(),
-            nn.Linear(ff_hidden, embed_size)
-        )
-        self.dropout = nn.Dropout(dropout)
+    def forward(self, x, state_dist, mask):
+        attn_out, state_dist = self.attn(x, state_dist, mask)
+        x = self.ln1(x + self.drop(attn_out))
 
-        self.hmm = DifferentiableHMM(num_states, embed_size)
-        self.num_states = num_states
+        ff = F.relu(self.ff1(x))
+        ff = self.ff2(ff)
 
-    def forward(self, x, state_dist, mask=None):
-        attn_out = self.attn(x, mask)
-        x = self.norm1(x + self.dropout(attn_out))
+        # noise + dithering in FF
+        if self.noise > 0:
+            ff = ff + torch.randn_like(ff) * self.noise
+        if self.dither > 0:
+            d = torch.randn_like(ff) * self.dither
+            ff = ff + d - d.mean(dim=-1, keepdim=True)
 
-        ff_out = self.ff(x)
-        x = self.norm2(x + self.dropout(ff_out))
-
-        # evolve HMM
-        next_state_dist, emission = self.hmm(state_dist)
-        x = x + emission.unsqueeze(1)
-
-        return x, next_state_dist
+        x = self.ln2(x + self.drop(ff))
+        return x, state_dist
 
 
 # =========================================================
-# DHMM-GPT Model
+# DHMM Head (LM + state head)
+# =========================================================
+class DHMMHead(nn.Module):
+    def __init__(self, embed_size, vocab_size, num_states):
+        super().__init__()
+        self.lm = nn.Linear(embed_size, vocab_size)
+        self.state = nn.Linear(embed_size, num_states)
+
+    def forward(self, x):
+        return self.lm(x), self.state(x)
+
+
+# =========================================================
+# Full DHMM-GPT Model
 # =========================================================
 class DHMMGPT(nn.Module):
-    def __init__(self, vocab_size, embed_size=256, num_layers=6,
-                 num_heads=8, ff_hidden=1024, num_states=16, max_len=128, dropout=0.1):
+    def __init__(self, vocab_size, embed_size=256, layers=6, heads=8,
+                 ff_hidden=1024, num_states=16, max_len=512,
+                 dropout=0.1, noise=0.01, dither=0.01, state_loss_weight=0.1):
         super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, embed_size)
-        self.pos_emb = nn.Embedding(max_len, embed_size)
-
-        self.layers = nn.ModuleList([
-            DHMMBlock(embed_size, num_heads, ff_hidden, num_states, dropout)
-            for _ in range(num_layers)
+        self.tok = nn.Embedding(vocab_size, embed_size)
+        self.pos = nn.Embedding(max_len, embed_size)
+        self.blocks = nn.ModuleList([
+            DHMMBlock(embed_size, heads, ff_hidden, num_states, dropout, noise, dither)
+            for _ in range(layers)
         ])
-        self.norm = nn.LayerNorm(embed_size)
-        self.fc_out = nn.Linear(embed_size, vocab_size)
-
+        self.ln_f = nn.LayerNorm(embed_size)
+        self.head = DHMMHead(embed_size, vocab_size, num_states)
         self.num_states = num_states
+        self.vocab_size = vocab_size
+        self.state_loss_weight = state_loss_weight
 
-    def forward(self, input_ids, mask=None, labels=None):
+    @staticmethod
+    def causal_mask(L, device):
+        return torch.tril(torch.ones(L, L, device=device)).unsqueeze(0).unsqueeze(0)
+
+    def forward(self, input_ids, labels=None, state_labels=None, attention_mask=None):
         B, L = input_ids.shape
-        tokens = self.token_emb(input_ids)
-        positions = self.pos_emb(torch.arange(L, device=input_ids.device)).unsqueeze(0).expand(B, -1, -1)
-        x = tokens + positions
+        device = input_ids.device
+        x = self.tok(input_ids) + self.pos(torch.arange(L, device=device)).unsqueeze(0)
 
-        # initial uniform HMM state
-        state_dist = torch.ones(B, self.num_states, device=input_ids.device) / self.num_states
+        mask = self.causal_mask(L, device)
+        if attention_mask is not None:
+            am = attention_mask[:, None, None, :].to(mask.dtype)
+            mask = mask * am
+        mask = mask.expand(B, -1, -1, -1)
 
-        for layer in self.layers:
-            x, state_dist = layer(x, state_dist, mask)
+        state_dist = torch.full((B, self.num_states), 1.0 / self.num_states, device=device)
 
-        x = self.norm(x)
-        logits = self.fc_out(x)
+        for blk in self.blocks:
+            x, state_dist = blk(x, state_dist, mask)
+
+        x = self.ln_f(x)
+        lm_logits, state_logits = self.head(x)
 
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
+            shift_logits = lm_logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
-                            shift_labels.view(-1))
+            lm_loss = F.cross_entropy(shift_logits.view(-1, self.vocab_size),
+                                      shift_labels.view(-1))
+            if state_labels is not None:
+                s_logits = state_logits[:, :-1, :].contiguous()
+                s_labels = state_labels[:, 1:].contiguous()
+                state_loss = F.cross_entropy(s_logits.view(-1, self.num_states),
+                                             s_labels.view(-1))
+                loss = lm_loss + self.state_loss_weight * state_loss
+            else:
+                loss = lm_loss
 
-        return {"logits": logits, "loss": loss}
-```
-
----
-
-# 🔎 Explanation
-
-### 1. **Differentiable HMM**
-
-* Each block evolves a **latent state distribution** using a softmaxed transition matrix.
-* The distribution emits embeddings added into the hidden stream.
-
-### 2. **Attention**
-
-* Standard GPT-2 causal attention.
-* Masking ensures autoregressive behavior.
-
-### 3. **Feedforward + Residual**
-
-* Two-layer MLP with ReLU.
-* Residual + LayerNorm like GPT-2.
-
-### 4. **Model Output**
-
-* Vocabulary logits for causal language modeling.
-* Optional **cross-entropy loss** if labels are passed.
-
----
-
-⚡ This is a **baseline DHMM-GPT**.
-👉 Do you want me to extend this version with **internal noise mutations + dithering filters** (like in AEON-MACHINE), or keep this “pure DHMM-GPT” first?
+        return {"logits": lm_logits, "state_logits": state_logits, "loss": loss}
