@@ -178,3 +178,103 @@ if __name__ == "__main__":
 ---
 
 👉 Do you want me to **upgrade this into an RL training setup** (e.g. PPO with DHMM-GPT2 as the policy model) so it actually learns to *solve* CartPole instead of just imitating random actions?
+
+Awesome ✅ — let’s formalize how to **turn algorithms into token languages** so that your **DHMM-GPT2** can learn them like it learns English or Python.
+
+---
+
+# 🔑 Step 1: Define the Alphabet (Tokens)
+
+Every algorithm is just a sequence of operations. To teach GPT-2, we need to map those into **discrete symbols**:
+
+* **Inputs** (numbers, arrays, states) → tokens
+* **Operators** (+, -, if, swap) → tokens
+* **Control signals** (start, end, done) → tokens
+* **Outputs** → tokens
+
+📌 Example: Addition
+
+```
+["2", "+", "3", "="] → ["5"]
+```
+
+Here, `"2"`, `"+"`, `"3"`, `"="`, and `"5"` are just token IDs in the vocabulary.
+
+---
+
+# 🔑 Step 2: Encode Algorithm Traces as Sequences
+
+For algorithms, we can generate training data by recording **traces**:
+
+* Run the algorithm step by step.
+* Each step → emit a token.
+
+📌 Example: Bubble Sort (on \[3,2,1])
+
+```
+[START], [3,2,1], [COMPARE 3,2], [SWAP], [2,3,1], [COMPARE 3,1], [SWAP], [2,1,3], ...
+```
+
+Each comparison and swap becomes part of the **“language of sorting”**.
+
+---
+
+# 🔑 Step 3: Training Objective
+
+* Same as text: predict the **next token**.
+* Loss = cross-entropy between predicted token distribution and the true next step.
+* The model learns to generate valid algorithm traces by autoregression.
+
+---
+
+# 🔑 Step 4: Decoding / Execution
+
+Once trained, you can:
+
+* Give the model an input program state (e.g. `[3,2,1]`).
+* Autoregressively generate the algorithm trace.
+* Decode the trace back into steps (actions).
+* Apply them to a real environment (like an array → sorted result, or a Gym env → solved state).
+
+---
+
+# ⚡ Examples of Algorithm-as-Language
+
+1. **Arithmetic**
+
+   ```
+   Input: ["7", "+", "5", "="]
+   Target: ["12"]
+   ```
+
+2. **Sorting**
+
+   ```
+   Input: [START, [4,1,3,2]]
+   Target: [COMPARE 4,1], [SWAP], [1,4,3,2], ...
+   ```
+
+3. **Gym (CartPole)**
+
+   ```
+   [RESET], [STATE_12], [ACT_LEFT], [STATE_15], [ACT_RIGHT], [DONE]
+   ```
+
+4. **Markov Chain Simulation**
+
+   ```
+   [S0], [S1], [S2], [S3], ...
+   ```
+
+---
+
+# 🚀 Why DHMM Helps
+
+* **HMM latent states**: act like an internal *program counter* → keeps track of algorithm stage.
+* **Noise (mutations)**: explores different possible algorithm traces.
+* **Dithering (filtering)**: stabilizes against chaotic transitions.
+* **GPT-style attention**: generalizes across algorithm patterns.
+
+---
+
+👉 To make this concrete, do you want me to **build a small demo where DHMM-GPT2 learns addition or sorting** as a token language, so you can see it mastering a simple algorithm before scaling to Gym?
