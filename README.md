@@ -448,3 +448,234 @@ if __name__ == "__main__":
 ---
 
 👉 Do you want me to next **extend this to sorting** (so DHMM-GPT2 learns the *language of sorting steps*, not just arithmetic)?
+
+Alright 🚀 — let’s build the **full `DHMMTransformerEncoderDecoder` model** in PyTorch. This combines:
+
+* **Encoder** → stacked DHMM-Transformer blocks.
+* **Decoder** → stacked DHMM-Transformer blocks with **causal masking** + **cross-attention** to the encoder.
+* **Cross-Attention** → decoder queries attend to encoder’s outputs, with latent DHMM states influencing attention.
+* **Noise + Dithering** → applied inside both encoder and decoder blocks.
+* **Heads** → produce next-token logits and latent-state logits.
+
+---
+
+# 📝 Full PyTorch Implementation
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+# =========================================================
+# Differentiable HMM
+# =========================================================
+class DifferentiableHMM(nn.Module):
+    def __init__(self, num_states, embed_size):
+        super().__init__()
+        self.transitions = nn.Parameter(torch.randn(num_states, num_states))
+        self.emitter = nn.Linear(num_states, embed_size)
+
+    def forward(self, state_dist):
+        A = self.transitions.softmax(dim=-1)
+        next_state = state_dist @ A
+        emission = self.emitter(next_state)
+        return next_state, emission
+
+
+# =========================================================
+# DHMM Attention (Self + Cross)
+# =========================================================
+class DHMMAttention(nn.Module):
+    def __init__(self, embed_size, num_heads, num_states,
+                 dropout=0.1, noise=0.01, dither=0.01):
+        super().__init__()
+        assert embed_size % num_heads == 0
+        self.h = num_heads
+        self.d = embed_size // num_heads
+        self.q = nn.Linear(embed_size, embed_size)
+        self.k = nn.Linear(embed_size, embed_size)
+        self.v = nn.Linear(embed_size, embed_size)
+        self.o = nn.Linear(embed_size, embed_size)
+        self.hmm = DifferentiableHMM(num_states, embed_size)
+        self.noise = noise
+        self.dither = dither
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, q_in, k_in, v_in, state_dist, mask=None):
+        B, Lq, E = q_in.shape
+        Lk = k_in.shape[1]
+        Q = self.q(q_in).view(B, Lq, self.h, self.d).transpose(1, 2)
+        K = self.k(k_in).view(B, Lk, self.h, self.d).transpose(1, 2)
+        V = self.v(v_in).view(B, Lk, self.h, self.d).transpose(1, 2)
+
+        scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.d)
+
+        # Markov bias
+        state_dist, emission = self.hmm(state_dist)
+        hmm_bias = emission.mean(dim=-1, keepdim=True)
+        scores = scores + hmm_bias.unsqueeze(-1)
+
+        # Noise + Dither
+        if self.noise > 0:
+            scores = scores + torch.randn_like(scores) * self.noise
+        if self.dither > 0:
+            d = torch.randn_like(scores) * self.dither
+            scores = scores + d - d.mean(dim=-1, keepdim=True)
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float("-inf"))
+
+        att = F.softmax(scores, dim=-1)
+        out = (att @ V).transpose(1, 2).contiguous().view(B, Lq, E)
+        return self.o(self.drop(out)), state_dist
+
+
+# =========================================================
+# Transformer Block (Encoder / Decoder)
+# =========================================================
+class DHMMBlock(nn.Module):
+    def __init__(self, embed_size, heads, ff_hidden, num_states,
+                 dropout=0.1, noise=0.01, dither=0.01, cross_attention=False):
+        super().__init__()
+        self.self_attn = DHMMAttention(embed_size, heads, num_states, dropout, noise, dither)
+        self.ln1 = nn.LayerNorm(embed_size)
+        self.ln2 = nn.LayerNorm(embed_size)
+        self.ff1 = nn.Linear(embed_size, ff_hidden)
+        self.ff2 = nn.Linear(ff_hidden, embed_size)
+        self.drop = nn.Dropout(dropout)
+        self.noise, self.dither = noise, dither
+        self.cross_attention = cross_attention
+        if cross_attention:
+            self.cross_attn = DHMMAttention(embed_size, heads, num_states, dropout, noise, dither)
+            self.ln_x = nn.LayerNorm(embed_size)
+
+    def forward(self, x, state_dist, mask=None, enc_out=None, enc_mask=None):
+        # Self-attention
+        sa, state_dist = self.self_attn(x, x, x, state_dist, mask)
+        x = self.ln1(x + self.drop(sa))
+
+        # Cross-attention (for decoder only)
+        if self.cross_attention and enc_out is not None:
+            ca, state_dist = self.cross_attn(x, enc_out, enc_out, state_dist, enc_mask)
+            x = self.ln_x(x + self.drop(ca))
+
+        # Feedforward
+        ff = F.relu(self.ff1(x))
+        ff = self.ff2(ff)
+        if self.noise > 0:
+            ff = ff + torch.randn_like(ff) * self.noise
+        if self.dither > 0:
+            d = torch.randn_like(ff) * self.dither
+            ff = ff + d - d.mean(dim=-1, keepdim=True)
+        x = self.ln2(x + self.drop(ff))
+        return x, state_dist
+
+
+# =========================================================
+# Heads
+# =========================================================
+class DHMMHead(nn.Module):
+    def __init__(self, embed_size, vocab_size, num_states):
+        super().__init__()
+        self.lm = nn.Linear(embed_size, vocab_size)
+        self.state = nn.Linear(embed_size, num_states)
+
+    def forward(self, x):
+        return self.lm(x), self.state(x)
+
+
+# =========================================================
+# Full Encoder–Decoder Model
+# =========================================================
+class DHMMTransformerEncoderDecoder(nn.Module):
+    def __init__(self, vocab_size, embed_size=256, layers=4, heads=8, ff_hidden=1024,
+                 num_states=16, max_len=512, dropout=0.1, noise=0.01, dither=0.01,
+                 state_loss_weight=0.1):
+        super().__init__()
+        self.tok = nn.Embedding(vocab_size, embed_size)
+        self.pos = nn.Embedding(max_len, embed_size)
+
+        # Encoder
+        self.encoder = nn.ModuleList([
+            DHMMBlock(embed_size, heads, ff_hidden, num_states,
+                      dropout, noise, dither, cross_attention=False)
+            for _ in range(layers)
+        ])
+
+        # Decoder
+        self.decoder = nn.ModuleList([
+            DHMMBlock(embed_size, heads, ff_hidden, num_states,
+                      dropout, noise, dither, cross_attention=True)
+            for _ in range(layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(embed_size)
+        self.head = DHMMHead(embed_size, vocab_size, num_states)
+        self.num_states, self.vocab_size, self.state_loss_weight = num_states, vocab_size, state_loss_weight
+
+    @staticmethod
+    def causal_mask(L, device):
+        return torch.tril(torch.ones(L, L, device=device)).unsqueeze(0).unsqueeze(0)
+
+    def forward(self, src_ids, tgt_ids, src_mask=None, tgt_mask=None,
+                labels=None, state_labels=None):
+        B, Ls = src_ids.shape
+        Lt = tgt_ids.shape[1]
+        device = src_ids.device
+
+        # Embeddings
+        src = self.tok(src_ids) + self.pos(torch.arange(Ls, device=device)).unsqueeze(0)
+        tgt = self.tok(tgt_ids) + self.pos(torch.arange(Lt, device=device)).unsqueeze(0)
+
+        # Masks
+        cmask = self.causal_mask(Lt, device)
+        if tgt_mask is not None:
+            cmask = cmask * tgt_mask[:, None, None, :]
+        if src_mask is not None:
+            src_mask = src_mask[:, None, None, :]
+
+        # Encoder
+        state_dist = torch.full((B, self.num_states), 1.0/self.num_states, device=device)
+        for blk in self.encoder:
+            src, state_dist = blk(src, state_dist, src_mask)
+
+        # Decoder
+        for blk in self.decoder:
+            tgt, state_dist = blk(tgt, state_dist, cmask, enc_out=src, enc_mask=src_mask)
+
+        x = self.ln_f(tgt)
+        lm_logits, state_logits = self.head(x)
+
+        loss = None
+        if labels is not None:
+            shift_logits = lm_logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            lm_loss = F.cross_entropy(shift_logits.view(-1, self.vocab_size),
+                                      shift_labels.view(-1))
+            if state_labels is not None:
+                s_logits = state_logits[:, :-1, :].contiguous()
+                s_labels = state_labels[:, 1:].contiguous()
+                state_loss = F.cross_entropy(s_logits.view(-1, self.num_states),
+                                             s_labels.view(-1))
+                loss = lm_loss + self.state_loss_weight * state_loss
+            else:
+                loss = lm_loss
+
+        return {"logits": lm_logits, "state_logits": state_logits, "loss": loss}
+```
+
+---
+
+## ✅ What You Get
+
+* A **full seq2seq Transformer** with **DHMM-enhanced attention**.
+* **Encoder**: processes input sequence with DHMM latent dynamics.
+* **Decoder**: autoregressively generates output sequence with **causal + cross attention**, also DHMM-enhanced.
+* **Noise + Dithering** built into blocks.
+* **Loss**: next-token prediction + optional latent state supervision.
+
+---
+
+👉 Do you want me to show a **toy training example** (like addition-as-translation: encode `"7+8="`, decode `"15"`) to demonstrate how this encoder–decoder works in practice?
