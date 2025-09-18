@@ -1,16 +1,3 @@
-Alright — let’s build a **complete Differentiable Hidden Markov GPT (DHMM-GPT)** from scratch.
-This will be a **GPT-2–style Transformer** extended with:
-
-* **Transformer blocks** → multi-head causal self-attention + feed-forward networks.
-* **Multi-head Attention** → with scaling, masking for autoregression.
-* **Differentiable HMM** → latent state distribution evolving across layers.
-* **Forwarding (residual + normalization)** → like GPT-2.
-* **Final LM Head** → to project into vocab logits for autoregressive language modeling.
-
-This version won’t include LoRA/PEFT unless you want, just the **core DHMM-GPT architecture**.
-
----
-
 # 📝 Full DHMM-GPT Implementation
 
 ```python
